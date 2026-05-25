@@ -1,64 +1,119 @@
 import { fileURLToPath } from 'url';
-import { dirname, join, resolve } from 'path';
+import { dirname, resolve } from 'path';
 import { config } from 'dotenv';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, '.env') });
 
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { Resend } from 'resend';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
 
-const WAITLIST_FILE = join(__dirname, 'waitlist.json');
 const PORT = process.env.PORT || 3457;
+const NETLIFY_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://nihongo-waitlist.netlify.app';
 
 const app = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+// ── Security middleware ───────────────────────────────────────────────────────
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function loadWaitlist() {
-  if (!existsSync(WAITLIST_FILE)) return [];
-  return JSON.parse(readFileSync(WAITLIST_FILE, 'utf-8'));
-}
+// CORS — nur die eigene Netlify-Domain + lokal
+app.use(cors({
+  origin: (origin, cb) => {
+    const allowed = [NETLIFY_ORIGIN, 'http://localhost:3456', 'http://localhost:7842'];
+    if (!origin || allowed.includes(origin)) return cb(null, true);
+    cb(new Error('CORS: Origin nicht erlaubt'));
+  }
+}));
 
-function saveWaitlist(list) {
-  writeFileSync(WAITLIST_FILE, JSON.stringify(list, null, 2));
-}
-
-// ── Routes ───────────────────────────────────────────────────────────────────
-
-// GET /api/count  — liefert aktuelle Anzahl der Anmeldungen
-app.get('/api/count', (_req, res) => {
-  res.json({ count: loadWaitlist().length });
+// Rate limiting — max 5 Signup-Versuche pro IP pro 15 Minuten
+const signupLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Zu viele Anfragen. Bitte warte 15 Minuten.' }
 });
 
-// POST /api/waitlist  — trägt neue E-Mail ein und verschickt Bestätigung
-app.post('/api/waitlist', async (req, res) => {
-  const { email } = req.body;
+// Allgemeines Rate Limit — 60 req/min pro IP
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+app.use(generalLimiter);
+app.use(express.json({ limit: '10kb' })); // Verhindert große Payload-Angriffe
+
+// ── Email validation ──────────────────────────────────────────────────────────
+const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
+
+// ── Resend Audience (persistenter Speicher) ───────────────────────────────────
+let audienceId = process.env.RESEND_AUDIENCE_ID || null;
+
+async function getOrCreateAudience() {
+  if (audienceId) return audienceId;
+  try {
+    const list = await resend.audiences.list();
+    const existing = list.data?.data?.find(a => a.name === 'Nihongo Waitlist');
+    if (existing) {
+      audienceId = existing.id;
+    } else {
+      const created = await resend.audiences.create({ name: 'Nihongo Waitlist' });
+      audienceId = created.data?.id;
+    }
+    return audienceId;
+  } catch (e) {
+    console.error('[Audience]', e.message);
+    return null;
+  }
+}
+
+async function getCount() {
+  try {
+    const id = await getOrCreateAudience();
+    if (!id) return 0;
+    const contacts = await resend.contacts.list({ audienceId: id });
+    return contacts.data?.data?.length ?? 0;
+  } catch { return 0; }
+}
+
+async function addContact(email) {
+  const id = await getOrCreateAudience();
+  if (!id) throw new Error('Audience nicht verfügbar');
+  // Resend gibt keinen Fehler bei Duplikaten zurück — sicher gegen Enumeration
+  await resend.contacts.create({ audienceId: id, email, unsubscribed: false });
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+app.get('/api/count', async (_req, res) => {
+  res.json({ count: await getCount() });
+});
+
+app.post('/api/waitlist', signupLimiter, async (req, res) => {
+  const { email } = req.body ?? {};
+
+  if (!email || typeof email !== 'string' || !EMAIL_RE.test(email.trim())) {
     return res.status(400).json({ error: 'Ungültige E-Mail-Adresse.' });
   }
 
-  const list = loadWaitlist();
+  const clean = email.trim().toLowerCase();
 
-  if (list.some(e => e.email === email)) {
-    return res.status(409).json({ error: 'Bereits eingetragen.' });
+  try {
+    await addContact(clean);
+  } catch (err) {
+    console.error('[Contact]', err.message);
+    // Trotzdem weiter — E-Mail senden (Duplikat-Enumeration verhindern)
   }
-
-  list.push({ email, signedUpAt: new Date().toISOString() });
-  saveWaitlist(list);
 
   // Bestätigungsmail
   try {
     await resend.emails.send({
       from: process.env.FROM_EMAIL || 'Nihongo <waitlist@nihongo.app>',
-      to: email,
+      to: clean,
       subject: 'Du bist auf der Nihongo-Warteliste 🎌',
       html: `
         <!DOCTYPE html>
@@ -68,33 +123,28 @@ app.post('/api/waitlist', async (req, res) => {
           <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a1f2e;padding:40px 20px">
             <tr><td align="center">
               <table width="520" cellpadding="0" cellspacing="0" style="background:#0f2535;border-radius:16px;overflow:hidden;border:1px solid rgba(45,139,139,.3)">
-                <!-- Header -->
                 <tr>
                   <td style="background:linear-gradient(135deg,#1A4F6B,#2D8B8B);padding:32px 40px;text-align:center">
                     <p style="margin:0;font-size:48px;line-height:1">語</p>
-                    <h1 style="margin:12px 0 0;color:#fff;font-size:28px;font-weight:700;letter-spacing:-.5px">Nihongo</h1>
+                    <h1 style="margin:12px 0 0;color:#fff;font-size:28px;font-weight:700">Nihongo</h1>
                     <p style="margin:4px 0 0;color:rgba(255,255,255,.7);font-size:13px;letter-spacing:.1em;text-transform:uppercase">Japanisch für Deutsche</p>
                   </td>
                 </tr>
-                <!-- Body -->
                 <tr>
                   <td style="padding:36px 40px">
                     <h2 style="margin:0 0 12px;color:#fff;font-size:22px;font-weight:600">Du bist dabei. 🎉</h2>
                     <p style="margin:0 0 16px;color:#9bbfbf;font-size:15px;line-height:1.65">
                       Wir benachrichtigen dich, sobald Nihongo im App Store verfügbar ist.
-                      Mehr Infos kommen noch — halte Ausschau.
                     </p>
                     <p style="margin:0;color:#6ea8a8;font-size:13px;line-height:1.6">
-                      Du hast dich mit <strong style="color:#9bbfbf">${email}</strong> eingetragen.
+                      Eingetragen mit <strong style="color:#9bbfbf">${clean}</strong>.
                     </p>
                   </td>
                 </tr>
-                <!-- Footer -->
                 <tr>
                   <td style="padding:20px 40px;border-top:1px solid rgba(45,139,139,.2);text-align:center">
                     <p style="margin:0;color:#4a7a7a;font-size:12px">
-                      Nihongo · iOS · Bald verfügbar<br>
-                      <a href="#" style="color:#4a7a7a">Abmelden</a>
+                      Nihongo · iOS · Bald verfügbar
                     </p>
                   </td>
                 </tr>
@@ -106,16 +156,16 @@ app.post('/api/waitlist', async (req, res) => {
       `,
     });
   } catch (err) {
-    // E-Mail-Fehler soll den Signup nicht blockieren — trotzdem loggen
     console.error('[Resend]', err.message);
   }
 
-  res.json({ ok: true, count: list.length });
+  // Immer 200 zurück — verhindert E-Mail-Enumeration (409 würde verraten ob Adresse existiert)
+  res.json({ ok: true });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅  Nihongo Waitlist Backend läuft auf http://localhost:${PORT}`);
-  console.log(`    POST /api/waitlist   → E-Mail eintragen + Bestätigung senden`);
-  console.log(`    GET  /api/count      → aktuelle Anzahl Anmeldungen`);
+  await getOrCreateAudience();
+  console.log(`    Audience ID: ${audienceId ?? 'wird beim ersten Signup erstellt'}`);
 });
