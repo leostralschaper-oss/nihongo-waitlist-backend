@@ -17,12 +17,33 @@ const app = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ── Proxy-Trust (Railway) ─────────────────────────────────────────────────────
-// Railway setzt X-Forwarded-For mit der echten Client-IP.
-// trust proxy: 1 → Express nimmt die letzte Proxy-IP aus X-Forwarded-For
-// und schreibt die vorherige (= echter Client) in req.ip.
-// Angreifer können keine eigenen X-Forwarded-For-Werte voranstellen,
-// da Railway den Header IMMER mit der echten IP ergänzt (appendet).
-app.set('trust proxy', 1);
+// Railway liegt hinter einem eigenen Reverse-Proxy und setzt:
+//   X-Forwarded-For: <client-ip>[, gespoofter-wert-vom-attacker]
+//   X-Real-IP:       <client-ip>   ← vom Proxy gesetzt, nicht überschreibbar
+//
+// Sicherheitsproblem mit trust proxy: 1 + X-Forwarded-For:
+//   Angreifer schickt X-Forwarded-For: fake-ip →
+//   Railway hängt echte IP an → "fake-ip, real-ip" →
+//   Express mit trust proxy: 1 nimmt "fake-ip" als req.ip → Bypass möglich.
+//
+// Lösung: Wir NICHT trust proxy einsetzen, sondern einen eigenen
+// IP-Resolver, der X-Real-IP bevorzugt (nur vom Proxy gesetzt).
+// Fallback: rechteste IP aus X-Forwarded-For (von Railway gesetzt).
+// Angreifer-kontrollierte Felder werden ignoriert.
+function getRealIP(req) {
+  // X-Real-IP: setzt Railway selbst, Clients können ihn nicht überschreiben
+  const xRealIp = req.headers['x-real-ip'];
+  if (xRealIp && /^[\d.]+$|^[0-9a-f:]+$/i.test(xRealIp.trim())) {
+    return xRealIp.trim();
+  }
+  // Fallback: rechteste IP aus X-Forwarded-For (von Railway hinzugefügt)
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    const ips = xff.split(',').map(s => s.trim());
+    return ips[ips.length - 1]; // letzte = von Railway gesetzt
+  }
+  return req.socket.remoteAddress ?? 'unknown';
+}
 
 // ── Security middleware ───────────────────────────────────────────────────────
 
@@ -42,10 +63,7 @@ const signupLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Zu viele Anfragen. Bitte warte 15 Minuten.' },
-  // Expliziter keyGenerator: immer req.ip (nach trust-proxy-Auflösung)
-  keyGenerator: (req) => req.ip,
-  // Verarbeite keine gekürzten IPs (verhindert ::ffff:-Normalisierungsprobleme)
-  skip: (req) => !req.ip
+  keyGenerator: (req) => getRealIP(req)   // spoofing-resistenter IP-Key
 });
 
 // Allgemeines Rate Limit — 60 req/min pro IP
@@ -54,7 +72,7 @@ const generalLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.ip
+  keyGenerator: (req) => getRealIP(req)
 });
 
 app.use(generalLimiter);
