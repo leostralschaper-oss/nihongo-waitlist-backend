@@ -16,6 +16,14 @@ const NETLIFY_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://nihongo-waitlist.n
 const app = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// ── Proxy-Trust (Railway) ─────────────────────────────────────────────────────
+// Railway setzt X-Forwarded-For mit der echten Client-IP.
+// trust proxy: 1 → Express nimmt die letzte Proxy-IP aus X-Forwarded-For
+// und schreibt die vorherige (= echter Client) in req.ip.
+// Angreifer können keine eigenen X-Forwarded-For-Werte voranstellen,
+// da Railway den Header IMMER mit der echten IP ergänzt (appendet).
+app.set('trust proxy', 1);
+
 // ── Security middleware ───────────────────────────────────────────────────────
 
 // CORS — nur die eigene Netlify-Domain + lokal
@@ -33,7 +41,11 @@ const signupLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Zu viele Anfragen. Bitte warte 15 Minuten.' }
+  message: { error: 'Zu viele Anfragen. Bitte warte 15 Minuten.' },
+  // Expliziter keyGenerator: immer req.ip (nach trust-proxy-Auflösung)
+  keyGenerator: (req) => req.ip,
+  // Verarbeite keine gekürzten IPs (verhindert ::ffff:-Normalisierungsprobleme)
+  skip: (req) => !req.ip
 });
 
 // Allgemeines Rate Limit — 60 req/min pro IP
@@ -41,7 +53,8 @@ const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip
 });
 
 app.use(generalLimiter);
