@@ -120,6 +120,17 @@ async function addContact(email) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+// Debug: zeigt wie Railway die IP auflöst (nur während Pentest, dann entfernen)
+app.get('/api/debug-ip', (req, res) => {
+  res.json({
+    resolvedKey: getRealIP(req),
+    socketRemote: req.socket.remoteAddress,
+    xRealIp: req.headers['x-real-ip'] ?? null,
+    xForwardedFor: req.headers['x-forwarded-for'] ?? null,
+    reqIp: req.ip
+  });
+});
+
 app.get('/api/count', async (_req, res) => {
   res.json({ count: await getCount() });
 });
